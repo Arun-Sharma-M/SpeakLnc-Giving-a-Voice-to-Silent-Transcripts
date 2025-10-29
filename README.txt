@@ -1,6 +1,6 @@
 ### **README: 
 
-**Author:** Arun Sharma
+**Author:** Arun Sharma M
 **Version:** 1.0
 **Last Updated:** October 2025
 
@@ -77,3 +77,4 @@ This document serves as a reproducible methodological reference for bioinformati
 Users can follow the stepwise R and shell scripts to reproduce each analytical stage, adapting parameters as needed for other RNA-Seq datasets.
 
 ---
+
