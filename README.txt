@@ -78,3 +78,17 @@ Users can follow the stepwise R and shell scripts to reproduce each analytical s
 
 ---
 
+Data and Code Availability
+
+The scripts provided in this repository document and support the computational analyses described in the following publication:
+
+Sharma Manjunath Arun, Neerkaje Subrayabhat Devaki. Decoding the role of novel long noncoding RNAs lnc-SLC6A12-1:3 and lnc-SLC6A12-7:5 in regulating the expression of GAD1 and SLC6A12 in cholangiocarcinoma. Computational Biology and Chemistry. 2025;119:108562.
+
+DOI: https://doi.org/10.1016/j.compbiolchem.2025.108562
+
+The article is available through PubMed and ScienceDirect.
+---
+
+License
+
+No licence Required
