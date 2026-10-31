@@ -13,7 +13,7 @@ library(stringr)
 ############################################################
 
 clinical_CHOL <- read.csv(
-  "clinical_CHOL_forlncRNA_all_35samples_old_new_merged.csv",
+  "clinical_CHOL_TCGA.csv",
   header = TRUE,
   stringsAsFactors = FALSE
 )
