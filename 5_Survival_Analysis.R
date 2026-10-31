@@ -1,128 +1,523 @@
-# script to run survival analysis using TCGA data
-# setwd("~/Desktop/demo/survivalAnalysis")
+############################################################
+# 1. LOAD LIBRARIES
+############################################################
 
-#BiocManager::install('TCGAbiolinks')
-
-#library(TCGAbiolinks)
-library(survminer)
 library(survival)
+library(survminer)
 library(tidyverse)
 library(stringr)
 
-# getting clinical data for TCGA-CHOL cohort -------------------
-#clinical_CHOL <- GDCquery_clinic("TCGA-CHOL")
-clinical_CHOL <- read.csv('clinical_CHOL_forlncRNA_all_35samples_old_new_merged.csv', header = TRUE, sep = ",")
-#clinical_CHOL[] <- lapply(clinical_CHOL, gsub, pattern = "'--", replacement = "", fixed = TRUE)
 
-any(colnames(clinical_CHOL) %in% c("vital_status", "days_to_last_follow_up", "days_to_death"))
-which(colnames(clinical_CHOL) %in% c("vital_status", "days_to_last_follow_up", "days_to_death"))
-clinical_CHOL[,c(18,22,32)]
+############################################################
+# 2. LOAD CLINICAL DATA
+############################################################
 
-# looking at some variables associated with survival 
-table(clinical_CHOL$vital_status)
+clinical_CHOL <- read.csv(
+  "clinical_CHOL_forlncRNA_all_35samples_old_new_merged.csv",
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
 
-# days_to_death, that is the number of days passed from the initial diagnosis to the patient’s death (clearly, this is only relevant for dead patients)
-# days_to_last_follow_up that is the number of days passed from the initial diagnosis to the last visit.
+# Check survival status
+print(table(clinical_CHOL$vital_status, useNA = "ifany"))
 
-# change certain values the way they are encoded
-clinical_CHOL$deceased <- ifelse(clinical_CHOL$vital_status == "Alive", FALSE, TRUE)
-table(clinical_CHOL$deceased)
+# Event: 1 = dead; 0 = alive/censored
+clinical_CHOL$deceased <- ifelse(
+  clinical_CHOL$vital_status == "Alive", 0,
+  ifelse(clinical_CHOL$vital_status == "Dead", 1, NA)
+)
 
-# Converting Days to Month by dividing Number of days / 30.417
+# Convert days to months
+clinical_CHOL$Months_to_last_follow_up <-
+  as.numeric(clinical_CHOL$days_to_last_follow_up) / 30.4375
 
-clinical_CHOL$Months_to_last_follow_up <- clinical_CHOL$days_to_last_follow_up/30.417
-clinical_CHOL$Months_to_death <- clinical_CHOL$days_to_death/30.417
+clinical_CHOL$Months_to_death <-
+  as.numeric(clinical_CHOL$days_to_death) / 30.4375
+
+# Calculate overall survival
+clinical_CHOL$overall_survival <- ifelse(
+  clinical_CHOL$deceased == 1,
+  clinical_CHOL$Months_to_death,
+  clinical_CHOL$Months_to_last_follow_up
+)
+
+# Retain valid clinical records
+clinical_CHOL <- clinical_CHOL %>%
+  filter(
+    !is.na(samplename),
+    trimws(samplename) != "",
+    !is.na(deceased),
+    !is.na(overall_survival),
+    is.finite(overall_survival),
+    overall_survival >= 0
+  )
+
+cat("Valid clinical records:", nrow(clinical_CHOL), "\n")
+print(table(clinical_CHOL$deceased))
 
 
-# create an "overall survival" variable that is equal to Months_to_death
-# for dead patients, and to Months_to_last_follow_up for patients who are still alive
-clinical_CHOL$overall_survival <- ifelse(clinical_CHOL$vital_status == "Alive",
-                                         clinical_CHOL$Months_to_last_follow_up,
-                                         clinical_CHOL$Months_to_death)
+############################################################
+# 3. LOAD EXPRESSION DATA
+############################################################
 
-#Remove entire rows with NA's in important columns with data for KM plot
+TCGA_CHOL_TPM_Data_full <- read.csv(
+  "TPM_CHOL_lncRNA_Tumour_Deseq.csv",
+  header = TRUE,
+  row.names = 1,
+  check.names = FALSE
+)
 
-#clinical_CHOL <- clinical_CHOL[-c(49:58), ]
-#clinical_CHOL$samplename.x <- str_replace_all(clinical_CHOL$samplename.x, '-', '.')
+# Select the 35 tumour samples
+TCGA_CHOL_TPM_Data <- TCGA_CHOL_TPM_Data_full[
+  , 7:41, drop = FALSE
+]
 
-# get mRNA expression data -----------
 
-TCGA_CHOL_TPM_Data_full <- read.csv('TPM_CHOL_lncRNA_Tumour_Deseq.csv', header = TRUE, sep = ",",row.names=1)
-TCGA_CHOL_TPM_Data <- TCGA_CHOL_TPM_Data_full[c(7:41)]
-head(TCGA_CHOL_TPM_Data)
+############################################################
+# 4. LOAD CANDIDATE GENES
+############################################################
 
-##########************************************************************##########
+transcript_data <- read.csv(
+  "1.Merge_SRA_TCGA_lncRNA_Pvalue_L2FC_dwnr.csv",
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
 
-# 1. Define the genes to be analyzed in a single list
-genes_to_analyze <- c("lnc-CYP2A6-2:1","LINC02362:35", "lnc-ADH4-3:2", "lnc-ADH4-3:3", "CYP4A22-AS1:3", "LINC02362:11", "LINC01093:1", "ALDH1L1-AS2:1","ALDH1L1-AS2:3")
+genes_to_analyze <- unique(
+  na.omit(transcript_data$Merge_SRA_TCGA_lncRNA_Pvalue_L2FC)
+)
 
-# 2. Get the mRNA expression data and reshape it to a long format
+# Keep genes present in the expression matrix
+genes_to_analyze <- intersect(
+  genes_to_analyze,
+  rownames(TCGA_CHOL_TPM_Data)
+)
+
+cat("Genes to analyse:", length(genes_to_analyze), "\n")
+
+
+############################################################
+# 5. RESHAPE EXPRESSION DATA
+############################################################
+
 exp_long <- TCGA_CHOL_TPM_Data %>%
   as.data.frame() %>%
-  rownames_to_column(var = 'GeneSymbol') %>%
-  gather(key = 'samplename', value = 'TPM', -GeneSymbol)
+  rownames_to_column(var = "GeneSymbol") %>%
+  pivot_longer(
+    cols = -GeneSymbol,
+    names_to = "samplename",
+    values_to = "TPM"
+  )
 
-# 3. Create a place to store the plots if you want to view them later
+exp_long$TPM <- as.numeric(exp_long$TPM)
+
+
+############################################################
+# 6. CHECK SAMPLE MATCHING
+############################################################
+
+cat(
+  "Expression samples:",
+  length(unique(exp_long$samplename)), "\n"
+)
+
+cat(
+  "Clinical samples:",
+  length(unique(clinical_CHOL$samplename)), "\n"
+)
+
+cat(
+  "Common samples:",
+  length(intersect(
+    unique(exp_long$samplename),
+    unique(clinical_CHOL$samplename)
+  )), "\n"
+)
+
+
+############################################################
+# 7. INITIALISE RESULTS AND PLOT LISTS
+############################################################
+
+survival_results <- list()
 median_plots <- list()
 quantile_plots <- list()
 
-# 4. Start the loop for each gene
+
+############################################################
+# 8. SURVIVAL ANALYSIS FOR EACH GENE
+############################################################
+
 for (gene in genes_to_analyze) {
   
-  # a) Filter data for the current gene and merge with clinical data
+  cat("Analysing:", gene, "\n")
+  
+  # Match expression with clinical data
   gene_data <- exp_long %>%
     filter(GeneSymbol == gene) %>%
-    merge(clinical_CHOL, by.x = 'samplename', by.y = 'samplename')
+    inner_join(clinical_CHOL, by = "samplename") %>%
+    filter(
+      !is.na(TPM),
+      is.finite(TPM),
+      !is.na(overall_survival),
+      is.finite(overall_survival),
+      !is.na(deceased),
+      overall_survival >= 0
+    )
   
-  # b) Handle median-split analysis
-  if (nrow(gene_data) > 0) {
-    # Denote which cases have higher or lower expression than the median
-    gene_data$strata_median <- ifelse(gene_data$TPM >= median(gene_data$TPM), "HIGH", "LOW")
-    
-    # Fit and plot survival curve for median split
-    fit_median <- survfit(Surv(overall_survival, deceased) ~ strata_median, data = gene_data)
-    p_median <- ggsurvplot(fit_median,
-                           data = gene_data,
-                           pval = TRUE,
-                           risk.table = TRUE,
-                           title = paste("TCGA_CHOL", gene, "Median_value", sep = "_"),
-                           surv.median.line = "hv",
-                           xlab = "Follow up in Months")
-    
-    median_plots[[gene]] <- p_median
-    message(paste("Generated median plot for:", gene))
-    print(p_median)
+  # Avoid counting duplicate patient records
+  if (anyDuplicated(gene_data$samplename)) {
+    warning("Duplicate sample IDs for gene: ", gene)
+    gene_data <- gene_data %>%
+      distinct(samplename, .keep_all = TRUE)
   }
   
-  # c) Handle quantile-split analysis
-  if (nrow(gene_data) > 0) {
-    # Denote which cases have higher or lower expression than the 75th percentile
-    gene_data$strata_quant <- ifelse(gene_data$TPM > quantile(gene_data$TPM, probs = 0.25), "Medium & High", "Low")
+  if (nrow(gene_data) < 2 ||
+      length(unique(gene_data$deceased)) < 2) {
+    next
+  }
+  
+  
+  ##########################################################
+  # 8A. MEDIAN CUTOFF: HIGH VS LOW
+  ##########################################################
+  
+  median_cutoff <- median(
+    gene_data$TPM,
+    na.rm = TRUE
+  )
+  
+  gene_data$median_group <- ifelse(
+    gene_data$TPM >= median_cutoff,
+    "High",
+    "Low"
+  )
+  
+  gene_data$median_group <- factor(
+    gene_data$median_group,
+    levels = c("Low", "High")
+  )
+  
+  if (length(unique(gene_data$median_group)) == 2) {
     
-    # Fit and plot survival curve for quantile split
-    fit_quant <- survfit(Surv(overall_survival, deceased) ~ strata_quant, data = gene_data)
-    p_quant <- ggsurvplot(fit_quant,
-                          data = gene_data,
-                          pval = TRUE,
-                          conf.int = TRUE,
-                          risk.table = TRUE,
-                          title = paste("TCGA_CHOL", gene, "quantile", sep = "_"),
-                          xlab = "Follow up in Months",
-                          legend.labs = c("Medium & High", "Low"),
-                          ncensor.plot = TRUE,
-                          surv.median.line = "hv",
-                          ggtheme = theme_bw(),
-                          palette = c("#e7002f", "#2E9FDF"))
+    # Kaplan-Meier model
+    km_med <- survfit(
+      Surv(overall_survival, deceased) ~ median_group,
+      data = gene_data
+    )
     
-    quantile_plots[[gene]] <- p_quant
-    message(paste("Generated quantile plot for:", gene))
-    print(p_quant)
+    # Log-rank test
+    logrank_med <- survdiff(
+      Surv(overall_survival, deceased) ~ median_group,
+      data = gene_data
+    )
+    
+    p_logrank_med <- pchisq(
+      logrank_med$chisq,
+      df = length(logrank_med$n) - 1,
+      lower.tail = FALSE
+    )
+    
+    # Cox regression: High vs Low
+    cox_med <- coxph(
+      Surv(overall_survival, deceased) ~ median_group,
+      data = gene_data
+    )
+    
+    sm_med <- summary(cox_med)
+    
+    HR_med <- sm_med$coefficients[1, "exp(coef)"]
+    p_cox_med <- sm_med$coefficients[1, "Pr(>|z|)"]
+    
+    CI_med <- sm_med$conf.int[
+      1, c("lower .95", "upper .95")
+    ]
+    
+    # Store results
+    survival_results[[paste0(gene, "_Median")]] <- data.frame(
+      Gene = gene,
+      Cutoff = "Median",
+      Cutoff_Value = median_cutoff,
+      
+      Low_N = sum(gene_data$median_group == "Low"),
+      High_N = sum(gene_data$median_group == "High"),
+      
+      Deaths_Low = sum(
+        gene_data$median_group == "Low" &
+          gene_data$deceased == 1
+      ),
+      
+      Deaths_High = sum(
+        gene_data$median_group == "High" &
+          gene_data$deceased == 1
+      ),
+      
+      Comparison = "High vs Low",
+      HR = HR_med,
+      HR_CI_Lower = CI_med[1],
+      HR_CI_Upper = CI_med[2],
+      Cox_P = p_cox_med,
+      Logrank_P = p_logrank_med
+    )
+    
+    # ORIGINAL MEDIAN PLOTTING STYLE
+    if (is.finite(p_logrank_med) && p_logrank_med < 0.05) {
+      
+      p_median <- ggsurvplot(
+        km_med,
+        data = gene_data,
+        pval = TRUE,
+        risk.table = TRUE,
+        title = paste(
+          "TCGA_CHOL", gene, "Median_value",
+          sep = "_"
+        ),
+        surv.median.line = "hv",
+        xlab = "Follow up in Months"
+      )
+      
+      median_plots[[gene]] <- p_median
+      
+      message(
+        paste(
+          "Significant (p < 0.05) - Generated median plot for:",
+          gene
+        )
+      )
+      
+      print(p_median)
+    }
+  }
+  
+  
+  ##########################################################
+  # 8B. Q25 CUTOFF: MEDIUM & HIGH VS LOW
+  ##########################################################
+  
+  q25_cutoff <- as.numeric(
+    quantile(
+      gene_data$TPM,
+      probs = 0.25,
+      na.rm = TRUE
+    )
+  )
+  
+  gene_data$q25_group <- ifelse(
+    gene_data$TPM > q25_cutoff,
+    "Medium & High",
+    "Low"
+  )
+  
+  gene_data$q25_group <- factor(
+    gene_data$q25_group,
+    levels = c("Low", "Medium & High")
+  )
+  
+  if (length(unique(gene_data$q25_group)) == 2) {
+    
+    # Kaplan-Meier model
+    km_q25 <- survfit(
+      Surv(overall_survival, deceased) ~ q25_group,
+      data = gene_data
+    )
+    
+    # Log-rank test
+    logrank_q25 <- survdiff(
+      Surv(overall_survival, deceased) ~ q25_group,
+      data = gene_data
+    )
+    
+    p_logrank_q25 <- pchisq(
+      logrank_q25$chisq,
+      df = length(logrank_q25$n) - 1,
+      lower.tail = FALSE
+    )
+    
+    # Cox regression: Medium & High vs Low
+    cox_q25 <- coxph(
+      Surv(overall_survival, deceased) ~ q25_group,
+      data = gene_data
+    )
+    
+    sm_q25 <- summary(cox_q25)
+    
+    HR_q25 <- sm_q25$coefficients[1, "exp(coef)"]
+    p_cox_q25 <- sm_q25$coefficients[1, "Pr(>|z|)"]
+    
+    CI_q25 <- sm_q25$conf.int[
+      1, c("lower .95", "upper .95")
+    ]
+    
+    # Store results
+    survival_results[[paste0(gene, "_Q25")]] <- data.frame(
+      Gene = gene,
+      Cutoff = "Q25",
+      Cutoff_Value = q25_cutoff,
+      
+      Low_N = sum(gene_data$q25_group == "Low"),
+      High_N = sum(
+        gene_data$q25_group == "Medium & High"
+      ),
+      
+      Deaths_Low = sum(
+        gene_data$q25_group == "Low" &
+          gene_data$deceased == 1
+      ),
+      
+      Deaths_High = sum(
+        gene_data$q25_group == "Medium & High" &
+          gene_data$deceased == 1
+      ),
+      
+      Comparison = "Medium & High vs Low",
+      HR = HR_q25,
+      HR_CI_Lower = CI_q25[1],
+      HR_CI_Upper = CI_q25[2],
+      Cox_P = p_cox_q25,
+      Logrank_P = p_logrank_q25
+    )
+    
+    # ORIGINAL Q25 PLOTTING STYLE
+    if (is.finite(p_logrank_q25) && p_logrank_q25 < 0.05) {
+      
+      p_quant <- ggsurvplot(
+        km_q25,
+        data = gene_data,
+        pval = TRUE,
+        conf.int = TRUE,
+        risk.table = TRUE,
+        title = paste(
+          "TCGA_CHOL", gene, "quantile",
+          sep = "_"
+        ),
+        xlab = "Follow up in Months",
+        legend.labs = c("Low", "Medium & High"),
+        ncensor.plot = TRUE,
+        surv.median.line = "hv",
+        ggtheme = theme_bw(),
+        palette = c("#2E9FDF", "#e7002f")
+      )
+      
+      quantile_plots[[gene]] <- p_quant
+      
+      message(
+        paste(
+          "Significant (p < 0.05) - Generated quantile plot for:",
+          gene
+        )
+      )
+      
+      print(p_quant)
+    }
   }
 }
 
-# 5. (Optional) Arrange and save all generated plots
-# This requires the 'ggpubr' package (which is part of survminer)
-# To save all median plots to a PDF:
-# ggsave("all_median_plots.pdf", arrange_ggsurvplots(median_plots), width = 10, height = 8)
-# To save all quantile plots to a PDF:
-# ggsave("all_quantile_plots.pdf", arrange_ggsurvplots(quantile_plots), width = 10, height = 8)
+
+############################################################
+# 9. COMBINE RESULTS AND CALCULATE FDR
+############################################################
+
+survival_results_df <- bind_rows(survival_results)
+
+if (nrow(survival_results_df) == 0) {
+  stop(
+    "No valid survival results were generated. ",
+    "Check clinical event coding and sample matching."
+  )
+}
+
+# Adjust Cox and log-rank P-values separately
+# within each cutoff family
+survival_results_df <- survival_results_df %>%
+  group_by(Cutoff) %>%
+  mutate(
+    Cox_FDR = p.adjust(Cox_P, method = "BH"),
+    Logrank_FDR = p.adjust(Logrank_P, method = "BH")
+  ) %>%
+  ungroup()
+
+
+############################################################
+# 10. CREATE FINAL RESULTS TABLE
+############################################################
+
+survival_table <- survival_results_df %>%
+  mutate(
+    `Expression cutoff` = Cutoff,
+    
+    `HR (95% CI)` = sprintf(
+      "%.3f (%.3f-%.3f)",
+      HR,
+      HR_CI_Lower,
+      HR_CI_Upper
+    ),
+    
+    `Cox P-value` = Cox_P,
+    `Cox FDR` = Cox_FDR,
+    `Log-rank P-value` = Logrank_P,
+    `Log-rank FDR` = Logrank_FDR
+  ) %>%
+  select(
+    Transcript = Gene,
+    `Expression cutoff`,
+    `Low-expression group (n)` = Low_N,
+    `High-expression group (n)` = High_N,
+    `Deaths in low group (n)` = Deaths_Low,
+    `Deaths in high group (n)` = Deaths_High,
+    `HR (95% CI)`,
+    `Cox P-value`,
+    `Cox FDR`,
+    `Log-rank P-value`,
+    `Log-rank FDR`
+  )
+
+
+############################################################
+# 11. DISPLAY RESULTS
+############################################################
+
+print(survival_table, n = Inf)
+
+# Nominally significant log-rank results
+print(
+  survival_table %>%
+    filter(`Log-rank P-value` < 0.05),
+  n = Inf
+)
+
+# Results with FDR < 0.05
+print(
+  survival_table %>%
+    filter(
+      `Cox FDR` < 0.05 |
+        `Log-rank FDR` < 0.05
+    ),
+  n = Inf
+)
+############################################################
+# 12. GENERATE TABLE OF NOMINALLY SIGNIFICANT RESULTS
+############################################################
+
+significant_survival_table <- survival_table %>%
+  filter(
+    `Cox P-value` < 0.05 |
+      `Log-rank P-value` < 0.05
+  ) %>%
+  arrange(`Log-rank P-value`) %>%
+  select(
+    Transcript,
+    `Expression cutoff`,
+    `Low-expression group (n)`,
+    `High-expression group (n)`,
+    `Deaths in low group (n)`,
+    `Deaths in high group (n)`,
+    `HR (95% CI)`,
+    `Cox P-value`,
+    `Cox FDR`,
+    `Log-rank P-value`,
+    `Log-rank FDR`
+  )
+
+print(significant_survival_table, n = Inf, width = Inf)
+write.csv(significant_survival_table,"CHOL_lncRNA_survival_results/Main_Manuscript_Survival_Table.csv", row.names = TRUE)
+
